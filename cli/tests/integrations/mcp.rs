@@ -4,16 +4,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 #[test]
-fn test_mcp_server_starts() {
-    let mut help_cmd = cargo_bin_cmd!("lemma");
-    help_cmd.arg("--help");
-    help_cmd
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("mcp"));
-}
-
-#[test]
 fn test_mcp_help_shows_admin_flag() {
     let mut cmd = cargo_bin_cmd!("lemma");
     cmd.args(["mcp", "--help"]);
@@ -23,14 +13,18 @@ fn test_mcp_help_shows_admin_flag() {
 }
 
 /// Send JSON-RPC messages to the MCP server and collect responses.
+/// `workdir: None` runs `lemma mcp` with no path (in-memory only; no disk read at startup).
 fn mcp_session(
-    workdir: &std::path::Path,
+    workdir: Option<&std::path::Path>,
     admin: bool,
     messages: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
     let bin = env!("CARGO_BIN_EXE_lemma");
     let mut cmd = Command::new(bin);
-    cmd.arg("mcp").arg(workdir);
+    cmd.arg("mcp");
+    if let Some(p) = workdir {
+        cmd.arg(p);
+    }
     if admin {
         cmd.arg("--admin");
     }
@@ -76,7 +70,7 @@ fn make_request(id: u64, method: &str, params: serde_json::Value) -> serde_json:
 }
 
 fn pricing_spec() -> &'static str {
-    "spec pricing\nfact quantity: [number]\nfact base_price: 10\nrule total: quantity * base_price\n"
+    "spec pricing\ndata quantity: number\ndata base_price: 10\nrule total: quantity * base_price\n"
 }
 
 fn write_spec(dir: &std::path::Path, filename: &str, content: &str) {
@@ -89,7 +83,7 @@ fn test_mcp_list_specs_includes_schema() {
     write_spec(temp_dir.path(), "pricing.lemma", pricing_spec());
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -116,11 +110,11 @@ fn test_mcp_list_specs_includes_schema() {
     );
     assert!(
         text.contains("quantity"),
-        "Should list fact names, got: {text}"
+        "Should list data names, got: {text}"
     );
     assert!(
         text.contains("base_price"),
-        "Should list fact names, got: {text}"
+        "Should list data names, got: {text}"
     );
     assert!(
         text.contains("total"),
@@ -134,11 +128,11 @@ fn test_mcp_evaluate_includes_reasoning() {
     write_spec(
         temp_dir.path(),
         "discount.lemma",
-        "spec discount\nfact quantity: [number]\nrule rate: 0 percent\n unless quantity >= 10 then 10 percent\n unless quantity >= 50 then 20 percent\n",
+        "spec discount\ndata quantity: number\nrule rate: 0 percent\n unless quantity >= 10 then 10 percent\n unless quantity >= 50 then 20 percent\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -150,7 +144,7 @@ fn test_mcp_evaluate_includes_reasoning() {
                     "arguments": {
                         "spec": "discount",
                         "rule": "rate",
-                        "facts": ["quantity=25"]
+                        "data": ["quantity=25"]
                     }
                 }),
             ),
@@ -172,7 +166,7 @@ fn test_mcp_evaluate_includes_reasoning() {
     );
     assert!(
         text.contains("quantity: 25"),
-        "Should show fact value in reasoning, got: {text}"
+        "Should show data value in reasoning, got: {text}"
     );
 }
 
@@ -181,7 +175,7 @@ fn test_mcp_read_only_by_default() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -192,7 +186,7 @@ fn test_mcp_read_only_by_default() {
                 json!({
                     "name": "add_spec",
                     "arguments": {
-                        "code": "spec test\nfact x: 5\nrule y: x"
+                        "code": "spec test\ndata x: 5\nrule y: x"
                     }
                 }),
             ),
@@ -241,7 +235,7 @@ fn test_mcp_admin_enables_add_spec() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -252,7 +246,7 @@ fn test_mcp_admin_enables_add_spec() {
                 json!({
                     "name": "add_spec",
                     "arguments": {
-                        "code": "spec test_spec\nfact x: 5\nrule y: x * 2"
+                        "code": "spec test_spec\ndata x: 5\nrule y: x * 2"
                     }
                 }),
             ),
@@ -303,7 +297,7 @@ fn test_mcp_get_spec_source() {
     write_spec(temp_dir.path(), "pricing.lemma", pricing_spec());
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -332,8 +326,8 @@ fn test_mcp_get_spec_source() {
         "Should contain spec declaration, got: {text}"
     );
     assert!(
-        text.contains("fact quantity"),
-        "Should contain fact declarations, got: {text}"
+        text.contains("data quantity"),
+        "Should contain data declarations, got: {text}"
     );
     assert!(
         text.contains("rule total"),
@@ -347,11 +341,11 @@ fn test_mcp_get_spec_source_blocked_without_admin() {
     write_spec(
         temp_dir.path(),
         "pricing.lemma",
-        "spec pricing\nfact x: 5\nrule y: x\n",
+        "spec pricing\ndata x: 5\nrule y: x\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -392,7 +386,7 @@ fn test_mcp_initialize_response() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[make_request(1, "initialize", json!({}))],
     );
@@ -419,7 +413,7 @@ fn test_mcp_get_schema_full_spec() {
     write_spec(temp_dir.path(), "pricing.lemma", pricing_spec());
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -443,11 +437,8 @@ fn test_mcp_get_schema_full_spec() {
         text.contains("pricing"),
         "Should mention spec name, got: {text}"
     );
-    assert!(text.contains("quantity"), "Should list facts, got: {text}");
-    assert!(
-        text.contains("base_price"),
-        "Should list facts, got: {text}"
-    );
+    assert!(text.contains("quantity"), "Should list data, got: {text}");
+    assert!(text.contains("base_price"), "Should list data, got: {text}");
     assert!(text.contains("total"), "Should list rules, got: {text}");
 }
 
@@ -457,11 +448,11 @@ fn test_mcp_get_schema_for_specific_rule() {
     write_spec(
         temp_dir.path(),
         "multi.lemma",
-        "spec multi\nfact a: [number]\nfact b: [number]\nrule sum: a + b\nrule product: a * b\n",
+        "spec multi\ndata a: number\ndata b: number\nrule sum: a + b\nrule product: a * b\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -492,7 +483,7 @@ fn test_mcp_get_schema_missing_spec() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -522,7 +513,7 @@ fn test_mcp_get_schema_empty_spec_name() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -553,11 +544,11 @@ fn test_mcp_evaluate_all_rules() {
     write_spec(
         temp_dir.path(),
         "multi.lemma",
-        "spec multi\nfact x: 3\nrule double: x * 2\nrule triple: x * 3\n",
+        "spec multi\ndata x: 3\nrule double: x * 2\nrule triple: x * 3\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -594,7 +585,7 @@ fn test_mcp_evaluate_missing_spec() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -619,7 +610,7 @@ fn test_mcp_evaluate_empty_spec_name() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -653,11 +644,11 @@ fn test_mcp_evaluate_veto_result() {
     write_spec(
         temp_dir.path(),
         "vetoed.lemma",
-        "spec vetoed\nfact price: -5\nrule validated: price\n unless price < 0 then veto \"Price cannot be negative\"\n",
+        "spec vetoed\ndata price: -5\nrule validated: price\n unless price < 0 then veto \"Price cannot be negative\"\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -693,11 +684,11 @@ fn test_mcp_evaluate_with_effective_datetime() {
     write_spec(
         temp_dir.path(),
         "simple.lemma",
-        "spec simple\nfact x: 42\nrule y: x\n",
+        "spec simple\ndata x: 42\nrule y: x\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -737,7 +728,7 @@ fn test_mcp_list_specs_empty_workspace() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -768,7 +759,7 @@ fn test_mcp_list_specs_empty_workspace_admin_suggests_add() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -794,6 +785,35 @@ fn test_mcp_list_specs_empty_workspace_admin_suggests_add() {
     );
 }
 
+#[test]
+fn test_mcp_omit_path_no_disk_at_startup() {
+    let responses = mcp_session(
+        None,
+        true,
+        &[
+            make_request(1, "initialize", json!({})),
+            make_request(
+                2,
+                "tools/call",
+                json!({
+                    "name": "list_specs",
+                    "arguments": {}
+                }),
+            ),
+        ],
+    );
+
+    assert!(responses.len() >= 2);
+    let text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("list_specs should return text");
+    assert!(
+        text.contains("No specs loaded"),
+        "Omitting path should start with empty engine, got: {text}"
+    );
+    assert!(text.contains("add_spec"));
+}
+
 // ── error handling ──────────────────────────────────────────────────────
 
 #[test]
@@ -801,7 +821,7 @@ fn test_mcp_invalid_jsonrpc_version() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[json!({
             "jsonrpc": "1.0",
@@ -825,7 +845,7 @@ fn test_mcp_unknown_method() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[make_request(1, "nonexistent/method", json!({}))],
     );
@@ -849,11 +869,9 @@ fn test_mcp_unknown_method() {
 
 #[test]
 fn test_mcp_malformed_json() {
-    let temp_dir = tempfile::tempdir().unwrap();
-
     let bin = env!("CARGO_BIN_EXE_lemma");
     let mut cmd = Command::new(bin);
-    cmd.arg("mcp").arg(temp_dir.path());
+    cmd.arg("mcp");
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -889,7 +907,7 @@ fn test_mcp_tools_call_missing_params() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -915,7 +933,7 @@ fn test_mcp_tools_call_missing_tool_name() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -937,7 +955,7 @@ fn test_mcp_tools_call_unknown_tool() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -972,7 +990,7 @@ fn test_mcp_add_spec_empty_code() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -1002,7 +1020,7 @@ fn test_mcp_add_spec_invalid_code() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -1032,7 +1050,7 @@ fn test_mcp_tools_list_read_only_tools() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -1071,7 +1089,7 @@ fn test_mcp_tools_list_admin_tools() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -1118,7 +1136,7 @@ fn test_mcp_tools_have_input_schemas() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -1151,15 +1169,15 @@ fn test_mcp_tools_have_input_schemas() {
     }
 }
 
-// ── evaluate with fact overrides ────────────────────────────────────────
+// ── evaluate with data overrides ────────────────────────────────────────
 
 #[test]
-fn test_mcp_evaluate_with_fact_overrides() {
+fn test_mcp_evaluate_with_data_overrides() {
     let temp_dir = tempfile::tempdir().unwrap();
     write_spec(temp_dir.path(), "pricing.lemma", pricing_spec());
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -1170,7 +1188,7 @@ fn test_mcp_evaluate_with_fact_overrides() {
                     "name": "evaluate",
                     "arguments": {
                         "spec": "pricing",
-                        "facts": ["quantity=5"]
+                        "data": ["quantity=5"]
                     }
                 }),
             ),
@@ -1199,7 +1217,7 @@ fn test_mcp_add_spec_then_evaluate() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -1209,7 +1227,7 @@ fn test_mcp_add_spec_then_evaluate() {
                 json!({
                     "name": "add_spec",
                     "arguments": {
-                        "code": "spec dynamic\nfact n: 7\nrule doubled: n * 2\n"
+                        "code": "spec dynamic\ndata n: 7\nrule doubled: n * 2\n"
                     }
                 }),
             ),
@@ -1254,7 +1272,7 @@ fn test_mcp_get_spec_source_missing_spec() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         true,
         &[
             make_request(1, "initialize", json!({})),
@@ -1287,11 +1305,11 @@ fn test_mcp_evaluate_invalid_effective() {
     write_spec(
         temp_dir.path(),
         "simple.lemma",
-        "spec simple\nfact x: 1\nrule y: x\n",
+        "spec simple\ndata x: 1\nrule y: x\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(1, "initialize", json!({})),
@@ -1325,6 +1343,61 @@ fn test_mcp_evaluate_invalid_effective() {
     );
 }
 
+#[test]
+fn test_mcp_evaluate_respects_effective_for_versioned_spec() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_spec(
+        temp_dir.path(),
+        "temporal.lemma",
+        r#"spec pricing 2025-01-01
+data base: 10
+rule total: base
+
+spec pricing 2026-01-01
+data base: 99
+rule total: base
+"#,
+    );
+
+    let run_eval = |effective: &str| -> String {
+        let responses = mcp_session(
+            Some(temp_dir.path()),
+            false,
+            &[
+                make_request(1, "initialize", json!({})),
+                make_request(
+                    2,
+                    "tools/call",
+                    json!({
+                        "name": "evaluate",
+                        "arguments": {
+                            "spec": "pricing",
+                            "effective": effective,
+                            "rule": "total"
+                        }
+                    }),
+                ),
+            ],
+        );
+        assert!(responses.len() >= 2, "expected evaluate response");
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("evaluate text")
+            .to_string()
+    };
+
+    let out_2025 = run_eval("2025-06-01");
+    let out_2026 = run_eval("2026-06-01");
+    assert!(
+        out_2025.contains("10") && !out_2025.contains("99"),
+        "2025 body should use v2025 base=10; got:\n{out_2025}"
+    );
+    assert!(
+        out_2026.contains("99"),
+        "2026 body should use v2026 base=99; got:\n{out_2026}"
+    );
+}
+
 // ── response IDs match request IDs ──────────────────────────────────────
 
 #[test]
@@ -1333,11 +1406,11 @@ fn test_mcp_response_ids_match_request_ids() {
     write_spec(
         temp_dir.path(),
         "simple.lemma",
-        "spec simple\nfact x: 1\nrule y: x\n",
+        "spec simple\ndata x: 1\nrule y: x\n",
     );
 
     let responses = mcp_session(
-        temp_dir.path(),
+        Some(temp_dir.path()),
         false,
         &[
             make_request(10, "initialize", json!({})),

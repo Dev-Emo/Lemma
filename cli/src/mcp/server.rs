@@ -42,16 +42,15 @@ mod imp {
         fn parse_error(message: String) -> Self {
             Self {
                 code: -32700,
-                message: format!("Lemma: {}", message),
+                message,
                 data: None,
             }
         }
 
-        #[allow(dead_code)]
         fn invalid_request(message: String) -> Self {
             Self {
                 code: -32600,
-                message: format!("Lemma: {}", message),
+                message,
                 data: None,
             }
         }
@@ -59,7 +58,7 @@ mod imp {
         fn method_not_found(method: String) -> Self {
             Self {
                 code: -32601,
-                message: format!("Lemma: Method not found: {method}"),
+                message: format!("Method not found: {method}"),
                 data: None,
             }
         }
@@ -67,7 +66,7 @@ mod imp {
         fn invalid_params(message: String) -> Self {
             Self {
                 code: -32602,
-                message: format!("Lemma: {}", message),
+                message,
                 data: None,
             }
         }
@@ -75,7 +74,7 @@ mod imp {
         fn internal_error(message: String) -> Self {
             Self {
                 code: -32603,
-                message: format!("Lemma: {}", message),
+                message,
                 data: None,
             }
         }
@@ -121,30 +120,45 @@ mod imp {
             Self { engine, config, sqlite_conn: conn }
         }
 
+        /// JSON-RPC 2.0: requests with no `id` are notifications and MUST NOT
+        /// receive a response (§4.1). Returns `None` for notifications, even
+        /// on error, so the transport layer skips the write entirely.
         fn handle_request(&mut self, request: McpRequest) -> Option<McpResponse> {
             debug!("Handling request: method={}", request.method);
 
+            let is_notification = request.id.is_none();
+
             if request.jsonrpc != "2.0" {
-                error!("Invalid JSON-RPC version: '{}', expected '2.0'. Continuing anyway.", request.jsonrpc);
+                if is_notification {
+                    debug!("Dropping notification with bad jsonrpc version");
+                    return None;
+                }
+                return Some(McpResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: None,
+                    error: Some(McpError::invalid_request(
+                        "Invalid JSON-RPC version, expected '2.0'".to_string(),
+                    )),
+                });
             }
 
-            // JSON-RPC 2.0: Notifications (no id) MUST NOT receive a response.
-            let is_notification = request.id.is_none();
+            if is_notification {
+                match request.method.as_str() {
+                    "notifications/initialized" => {
+                        debug!("Client signalled notifications/initialized");
+                    }
+                    other => {
+                        debug!("Ignoring notification: {}", other);
+                    }
+                }
+                return None;
+            }
 
             let result = match request.method.as_str() {
                 "initialize" => self.initialize(),
-                "notifications/initialized" | "initialized" => {
-                    info!("Client initialized notification received");
-                    if is_notification { return None; }
-                    Ok(serde_json::json!({}))
-                }
-                "ping" => Ok(serde_json::json!({})),
                 "tools/list" => self.list_tools(),
                 "tools/call" => self.call_tool(request.params),
-                _ if is_notification => {
-                    debug!("Ignoring unknown notification: {}", request.method);
-                    return None;
-                }
                 _ => Err(McpError::method_not_found(request.method)),
             };
 
@@ -186,22 +200,22 @@ mod imp {
             let mut tools = vec![
                 serde_json::json!({
                     "name": "evaluate",
-                "description": "Evaluate rules in a Lemma spec. Returns the result and a step-by-step reasoning trace showing which facts were used and which conditions matched. Omit 'rule' to evaluate all rules.",
+                "description": "Evaluate rules in a Lemma spec. Returns the result and a step-by-step reasoning trace showing which data were used and which conditions matched. Omit 'rule' to evaluate all rules.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "spec": {
                                         "type": "string",
-                                        "description": "Spec id: name or name~hash (8 hex) to pin content, e.g. pricing or pricing~a1b2c3d4"
+                                        "description": "Spec name, e.g. pricing"
                             },
                             "rule": {
                                 "type": "string",
                                 "description": "Optional: name of a specific rule to evaluate. Omit to evaluate all rules."
                             },
-                            "facts": {
+                            "data": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Optional fact values as 'name=value' (e.g. ['price=100', 'quantity=5'])",
+                                "description": "Optional data values as 'name=value' (e.g. ['price=100', 'quantity=5'])",
                                 "default": []
                             },
                             "effective": {
@@ -214,7 +228,7 @@ mod imp {
                 }),
                 serde_json::json!({
                     "name": "list_specs",
-                    "description": "List all loaded Lemma specs with their schemas: fact names, types, defaults, and rule names with return types.",
+                    "description": "List all loaded Lemma specs with their schemas: data names, types, defaults, and rule names with return types.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -227,13 +241,13 @@ mod imp {
                 }),
                 serde_json::json!({
                     "name": "get_schema",
-                "description": "Get a spec's schema: its facts (inputs with types, constraints, and defaults) and rules (outputs with types). Optionally scope to a specific rule to see only the facts it needs. Use this before calling evaluate to know which facts to provide.",
+                "description": "Get a spec's schema: its data (inputs with types, constraints, and defaults) and rules (outputs with types). Optionally scope to a specific rule to see only the data it needs. Use this before calling evaluate to know which data to provide.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "spec": {
                                         "type": "string",
-                                        "description": "Spec id: name or name~hash (8 hex), e.g. pricing or pricing~a1b2c3d4"
+                                        "description": "Spec name, e.g. pricing"
                                     },
                                     "rule": {
                                         "type": "string",
@@ -431,17 +445,17 @@ mod imp {
             &mut self,
             args: &serde_json::Value,
         ) -> Result<serde_json::Value, McpError> {
-            let spec_id = args["spec"]
+            let spec_set_id = args["spec"]
                 .as_str()
                 .ok_or_else(|| McpError::invalid_params("Missing 'spec' field".to_string()))?;
 
-            if spec_id.trim().is_empty() {
+            if spec_set_id.trim().is_empty() {
                 return Err(McpError::invalid_params(
-                    "Spec id cannot be empty".to_string(),
+                    "SpecSet id cannot be empty".to_string(),
                 ));
             }
 
-            let (_base_name, _) = lemma::parse_spec_id(spec_id.trim())
+            lemma::parse_spec_set_id(spec_set_id.trim())
                 .map_err(|e| McpError::invalid_params(format!("{}", e)))?;
 
             let rule_names: Vec<String> = match args.get("rule").and_then(|v| v.as_str()) {
@@ -449,12 +463,12 @@ mod imp {
                 _ => Vec::new(),
             };
 
-            let facts: Vec<&str> = args["facts"]
+            let data: Vec<&str> = args["data"]
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
 
-            let fact_values: std::collections::HashMap<String, String> = facts
+            let data_values: std::collections::HashMap<String, String> = data
                 .iter()
                 .filter_map(|s| {
                     s.split_once('=')
@@ -464,37 +478,31 @@ mod imp {
 
             let now = resolve_effective(args)?;
 
-            let plan = self
-                .engine
-                .get_plan(spec_id.trim(), Some(&now))
-                .map_err(|e| {
-                    McpError::internal_error(format!("Failed to get plan for spec: {e}"))
-                })?;
-            let plan_hash = plan.plan_hash();
+            // Cache Key Generation (Deterministic SHA-256)
+            let plan_hash = self.engine.get_plan(spec_set_id.trim(), Some(&now))
+                .map(|p| p.plan_hash())
+                .unwrap_or_else(|_| "no-plan".to_string());
 
-            // Cache Key Computation
-            use sha2::{Sha256, Digest};
-            let mut hasher = Sha256::new();
-            hasher.update(spec_id.trim().as_bytes());
-            hasher.update(plan_hash.as_bytes());
+            let mut sorted_facts: Vec<_> = data_values.iter().collect();
+            sorted_facts.sort_by_key(|(k, _)| *k);
+            let facts_str = sorted_facts.iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join("|");
+
             let mut sorted_rules = rule_names.clone();
             sorted_rules.sort();
-            for r in &sorted_rules {
-                hasher.update(r.as_bytes());
-            }
-            let mut sorted_facts: Vec<(&String, &String)> = fact_values.iter().collect();
-            sorted_facts.sort_by_key(|k| k.0);
-            for (k, v) in sorted_facts {
-                hasher.update(k.as_bytes());
-                hasher.update(b"=");
-                hasher.update(v.as_bytes());
-            }
+            let rules_str = sorted_rules.join(",");
+
+            let cache_input = format!("{}:{}:{}:{}", spec_set_id.trim(), plan_hash, facts_str, rules_str);
+            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+            sha2::Digest::update(&mut hasher, cache_input.as_bytes());
             let cache_hash = format!("{:x}", hasher.finalize());
 
             // Check SQLite Cache
             if let Ok(mut stmt) = self.sqlite_conn.prepare("SELECT output FROM eval_cache WHERE hash = ?") {
                 if let Ok(cached_output) = stmt.query_row([&cache_hash], |row| row.get::<_, String>(0)) {
-                    info!("Cache hit for spec '{}'", spec_id.trim());
+                    info!("Cache hit for spec '{}'", spec_set_id.trim());
                     return Ok(serde_json::json!({
                         "content": [{
                             "type": "text",
@@ -506,7 +514,7 @@ mod imp {
 
             let mut response = self
                 .engine
-                .run(spec_id.trim(), Some(&now), fact_values, false)
+                .run(spec_set_id.trim(), Some(&now), data_values, false)
                 .map_err(|e| {
                     error!("Evaluation failed: {}", e);
                     McpError::internal_error(format!("Evaluation failed: {e}"))
@@ -516,7 +524,7 @@ mod imp {
             }
 
             let mut output = String::new();
-            output.push_str(&format!("spec: {}\n", spec_id.trim()));
+            output.push_str(&format!("spec: {}\n", spec_set_id.trim()));
             output.push_str(&format!("effective: {}\n", now));
             output.push_str(&format!("hash: {}\n", plan_hash));
             output.push('\n');
@@ -527,12 +535,8 @@ mod imp {
                     lemma::OperationResult::Value(value) => {
                         output.push_str(&value.to_string());
                     }
-                    lemma::OperationResult::Veto(msg) => {
-                        if let Some(veto) = msg {
-                            output.push_str(&format!("veto ({})", veto));
-                        } else {
-                            output.push_str("veto");
-                        }
+                    lemma::OperationResult::Veto(reason) => {
+                        output.push_str(&format!("veto ({})", reason));
                     }
                 }
                 output.push('\n');
@@ -557,7 +561,7 @@ mod imp {
 
             info!(
                 "Evaluated spec '{}' with {} results (newly cached)",
-                spec_id.trim(),
+                spec_set_id.trim(),
                 response.results.len()
             );
 
@@ -603,27 +607,27 @@ mod imp {
         }
 
         fn tool_get_schema(&self, args: &serde_json::Value) -> Result<serde_json::Value, McpError> {
-            let spec_id = args["spec"]
+            let spec_set_id = args["spec"]
                 .as_str()
                 .ok_or_else(|| McpError::invalid_params("Missing 'spec' field".to_string()))?;
 
-            if spec_id.trim().is_empty() {
+            if spec_set_id.trim().is_empty() {
                 return Err(McpError::invalid_params(
-                    "Spec id cannot be empty".to_string(),
+                    "SpecSet id cannot be empty".to_string(),
                 ));
             }
 
-            lemma::parse_spec_id(spec_id.trim())
+            lemma::parse_spec_set_id(spec_set_id.trim())
                 .map_err(|e| McpError::invalid_params(format!("{}", e)))?;
 
             let now = resolve_effective(args)?;
             let plan = self
                 .engine
-                .get_plan(spec_id.trim(), Some(&now))
+                .get_plan(spec_set_id.trim(), Some(&now))
                 .map_err(|_| {
                     McpError::invalid_params(format!(
                         "Spec '{}' not found. Use list_specs to see available specs.",
-                        spec_id.trim()
+                        spec_set_id.trim()
                     ))
                 })?;
 
@@ -642,17 +646,17 @@ mod imp {
             };
 
             let scope = if rule_names.is_empty() {
-                format!("{} (all rules)", spec_id.trim())
+                format!("{} (all rules)", spec_set_id.trim())
             } else {
-                format!("{}.{}", spec_id.trim(), rule_names[0])
+                format!("{}.{}", spec_set_id.trim(), rule_names[0])
             };
 
             let output = format!("Schema for {}:\n\n{}", scope, schema);
 
             info!(
-                "Returned schema for '{}' ({} facts, {} rules)",
+                "Returned schema for '{}' ({} data, {} rules)",
                 scope,
-                schema.facts.len(),
+                schema.data.len(),
                 schema.rules.len()
             );
 
@@ -670,12 +674,12 @@ mod imp {
     /// Linearise an explanation tree into plain-English reasoning steps.
     fn format_explanation_steps(explanation: &lemma::explanation::Explanation) -> String {
         let mut steps = Vec::new();
-        let mut seen_facts = std::collections::HashSet::new();
+        let mut seen_data = std::collections::HashSet::new();
         let mut seen_rules = std::collections::HashSet::new();
         walk_explanation_node(
             &explanation.tree,
             &mut steps,
-            &mut seen_facts,
+            &mut seen_data,
             &mut seen_rules,
         );
         steps.join("\n")
@@ -684,7 +688,7 @@ mod imp {
     fn walk_explanation_node(
         node: &lemma::explanation::ExplanationNode,
         steps: &mut Vec<String>,
-        seen_facts: &mut std::collections::HashSet<String>,
+        seen_data: &mut std::collections::HashSet<String>,
         seen_rules: &mut std::collections::HashSet<String>,
     ) {
         use lemma::explanation::{ExplanationNode, ValueSource};
@@ -692,11 +696,11 @@ mod imp {
         match node {
             ExplanationNode::Value {
                 value,
-                source: ValueSource::Fact { fact_ref },
+                source: ValueSource::Data { data_ref },
                 ..
             } => {
-                let key = fact_ref.to_string();
-                if seen_facts.insert(key.clone()) {
+                let key = data_ref.to_string();
+                if seen_data.insert(key.clone()) {
                     steps.push(format!("{}: {}", key, value));
                 }
             }
@@ -713,19 +717,14 @@ mod imp {
                 if !seen_rules.insert(key) {
                     return;
                 }
-                walk_explanation_node(expansion, steps, seen_facts, seen_rules);
+                walk_explanation_node(expansion, steps, seen_data, seen_rules);
                 match result {
                     lemma::OperationResult::Value(v) => {
                         steps.push(format!("{}: {}", rule_path.rule, v));
                     }
-                    lemma::OperationResult::Veto(msg) => match msg {
-                        Some(reason) => {
-                            steps.push(format!("{}: veto ({})", rule_path.rule, reason));
-                        }
-                        None => {
-                            steps.push(format!("{}: veto", rule_path.rule));
-                        }
-                    },
+                    lemma::OperationResult::Veto(reason) => {
+                        steps.push(format!("{}: veto ({})", rule_path.rule, reason));
+                    }
                 }
             }
 
@@ -737,7 +736,7 @@ mod imp {
                 ..
             } => {
                 for op in operands {
-                    walk_explanation_node(op, steps, seen_facts, seen_rules);
+                    walk_explanation_node(op, steps, seen_data, seen_rules);
                 }
                 let expr = if original_expression != expression && !original_expression.is_empty() {
                     original_expression.as_str()
@@ -752,12 +751,12 @@ mod imp {
                 non_matched,
                 ..
             } => {
-                // Collect facts from all branch conditions first
+                // Collect data from all branch conditions first
                 for branch in non_matched {
-                    collect_branch_facts(&branch.condition, steps, seen_facts);
+                    collect_branch_data(&branch.condition, steps, seen_data);
                 }
                 if let Some(cond) = &matched.condition {
-                    collect_branch_facts(cond, steps, seen_facts);
+                    collect_branch_data(cond, steps, seen_data);
                 }
 
                 // Emit non-matched branch decisions
@@ -783,7 +782,7 @@ mod imp {
                 }
 
                 // Walk the matched result
-                walk_explanation_node(&matched.result, steps, seen_facts, seen_rules);
+                walk_explanation_node(&matched.result, steps, seen_data, seen_rules);
             }
 
             ExplanationNode::Condition {
@@ -794,7 +793,7 @@ mod imp {
                 ..
             } => {
                 for op in operands {
-                    walk_explanation_node(op, steps, seen_facts, seen_rules);
+                    walk_explanation_node(op, steps, seen_data, seen_rules);
                 }
                 let expr = if original_expression != expression && !original_expression.is_empty() {
                     original_expression.as_str()
@@ -812,34 +811,34 @@ mod imp {
         }
     }
 
-    /// Walk an explanation node collecting only fact values (no reasoning steps).
-    /// Used to gather facts from branch conditions before emitting branch decisions.
-    fn collect_branch_facts(
+    /// Walk an explanation node collecting only data values (no reasoning steps).
+    /// Used to gather data from branch conditions before emitting branch decisions.
+    fn collect_branch_data(
         node: &lemma::explanation::ExplanationNode,
         steps: &mut Vec<String>,
-        seen_facts: &mut std::collections::HashSet<String>,
+        seen_data: &mut std::collections::HashSet<String>,
     ) {
         use lemma::explanation::{ExplanationNode, ValueSource};
 
         match node {
             ExplanationNode::Value {
                 value,
-                source: ValueSource::Fact { fact_ref },
+                source: ValueSource::Data { data_ref },
                 ..
             } => {
-                let key = fact_ref.to_string();
-                if seen_facts.insert(key.clone()) {
+                let key = data_ref.to_string();
+                if seen_data.insert(key.clone()) {
                     steps.push(format!("{}: {}", key, value));
                 }
             }
             ExplanationNode::Condition { operands, .. }
             | ExplanationNode::Computation { operands, .. } => {
                 for op in operands {
-                    collect_branch_facts(op, steps, seen_facts);
+                    collect_branch_data(op, steps, seen_data);
                 }
             }
             ExplanationNode::RuleReference { expansion, .. } => {
-                collect_branch_facts(expansion, steps, seen_facts);
+                collect_branch_data(expansion, steps, seen_data);
             }
             ExplanationNode::Branches {
                 matched,
@@ -847,12 +846,12 @@ mod imp {
                 ..
             } => {
                 for b in non_matched {
-                    collect_branch_facts(&b.condition, steps, seen_facts);
+                    collect_branch_data(&b.condition, steps, seen_data);
                 }
                 if let Some(c) = &matched.condition {
-                    collect_branch_facts(c, steps, seen_facts);
+                    collect_branch_data(c, steps, seen_data);
                 }
-                collect_branch_facts(&matched.result, steps, seen_facts);
+                collect_branch_data(&matched.result, steps, seen_data);
             }
             _ => {}
         }
@@ -881,9 +880,9 @@ mod imp {
             }
             ExplanationNode::RuleReference { rule_path, .. } => rule_path.rule.to_string(),
             ExplanationNode::Value {
-                source: ValueSource::Fact { fact_ref },
+                source: ValueSource::Data { data_ref },
                 ..
-            } => fact_ref.to_string(),
+            } => data_ref.to_string(),
             ExplanationNode::Value { value, .. } => value.to_string(),
             ExplanationNode::Branches { .. } => "branch".to_string(),
             ExplanationNode::Veto { message, .. } => {
@@ -920,8 +919,11 @@ mod imp {
                 continue;
             }
 
-            eprintln!("MCP Received: {}", line);
+            debug!("Received: {}", line);
 
+            // Parse error responds with id: null (JSON-RPC 2.0 §4.2). For
+            // any successfully-parsed notification, handle_request returns
+            // None and we MUST NOT write anything back.
             let response = match serde_json::from_str::<McpRequest>(&line) {
                 Ok(request) => server.handle_request(request),
                 Err(e) => {
@@ -940,11 +942,83 @@ mod imp {
                 writeln!(stdout, "{}", response_json)?;
                 stdout.flush()?;
                 debug!("Sent response");
+            } else {
+                debug!("No response (notification)");
             }
         }
 
         info!("MCP server shutting down");
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn server() -> McpServer {
+            McpServer::new(Engine::new(), McpConfig::default())
+        }
+
+        fn parse(line: &str) -> McpRequest {
+            serde_json::from_str(line).expect("test fixture must be valid JSON-RPC")
+        }
+
+        #[test]
+        fn notification_returns_no_response() {
+            let mut s = server();
+            let req = parse(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+            assert!(s.handle_request(req).is_none());
+        }
+
+        #[test]
+        fn notification_with_unknown_method_still_silent() {
+            let mut s = server();
+            let req = parse(r#"{"jsonrpc":"2.0","method":"some/random/notification"}"#);
+            assert!(s.handle_request(req).is_none());
+        }
+
+        #[test]
+        fn notification_with_bad_jsonrpc_version_silent() {
+            let mut s = server();
+            let req = parse(r#"{"jsonrpc":"1.0","method":"notifications/initialized"}"#);
+            assert!(s.handle_request(req).is_none());
+        }
+
+        #[test]
+        fn request_with_id_gets_response() {
+            let mut s = server();
+            let req = parse(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+            let resp = s.handle_request(req).expect("request must yield response");
+            assert_eq!(resp.id, Some(serde_json::json!(1)));
+            assert!(resp.result.is_some());
+            assert!(resp.error.is_none());
+        }
+
+        #[test]
+        fn request_with_unknown_method_returns_method_not_found() {
+            let mut s = server();
+            let req = parse(r#"{"jsonrpc":"2.0","id":7,"method":"does/not/exist"}"#);
+            let resp = s.handle_request(req).expect("request must yield response");
+            assert_eq!(resp.id, Some(serde_json::json!(7)));
+            assert_eq!(resp.error.as_ref().expect("error expected").code, -32601);
+        }
+
+        #[test]
+        fn request_with_bad_jsonrpc_version_returns_invalid_request() {
+            let mut s = server();
+            let req = parse(r#"{"jsonrpc":"1.0","id":2,"method":"initialize"}"#);
+            let resp = s.handle_request(req).expect("request must yield response");
+            assert_eq!(resp.error.as_ref().expect("error expected").code, -32600);
+        }
+
+        #[test]
+        fn initialize_advertises_tools_list_changed_false() {
+            let mut s = server();
+            let req = parse(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+            let resp = s.handle_request(req).expect("request must yield response");
+            let result = resp.result.expect("result expected");
+            assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+        }
     }
 }
 
