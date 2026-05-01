@@ -1,4 +1,5 @@
 mod imp {
+    use sha2::Digest;
     use anyhow::Result;
     use lemma::parsing::ast::DateTimeValue;
     use lemma::Engine;
@@ -479,9 +480,18 @@ mod imp {
             let now = resolve_effective(args)?;
 
             // Cache Key Generation (Deterministic SHA-256)
-            let plan_hash = self.engine.get_plan(spec_set_id.trim(), Some(&now))
-                .map(|p| p.plan_hash())
-                .unwrap_or_else(|_| "no-plan".to_string());
+            let plan_hash = match self.engine.get_plan(spec_set_id.trim(), Some(&now)) {
+                Ok(p) => {
+                    let mut plan_hasher = sha2::Sha256::new();
+                    for ((name, effective), source) in &p.sources {
+                        plan_hasher.update(name.as_bytes());
+                        plan_hasher.update(format!("{:?}", effective).as_bytes());
+                        plan_hasher.update(source.as_bytes());
+                    }
+                    format!("{:x}", plan_hasher.finalize())
+                }
+                Err(_) => "no-plan".to_string(),
+            };
 
             let mut sorted_facts: Vec<_> = data_values.iter().collect();
             sorted_facts.sort_by_key(|(k, _)| *k);
