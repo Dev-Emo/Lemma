@@ -42,15 +42,16 @@ mod imp {
         fn parse_error(message: String) -> Self {
             Self {
                 code: -32700,
-                message,
+                message: format!("Lemma: {}", message),
                 data: None,
             }
         }
 
+        #[allow(dead_code)]
         fn invalid_request(message: String) -> Self {
             Self {
                 code: -32600,
-                message,
+                message: format!("Lemma: {}", message),
                 data: None,
             }
         }
@@ -58,7 +59,7 @@ mod imp {
         fn method_not_found(method: String) -> Self {
             Self {
                 code: -32601,
-                message: format!("Method not found: {method}"),
+                message: format!("Lemma: Method not found: {method}"),
                 data: None,
             }
         }
@@ -66,7 +67,7 @@ mod imp {
         fn invalid_params(message: String) -> Self {
             Self {
                 code: -32602,
-                message,
+                message: format!("Lemma: {}", message),
                 data: None,
             }
         }
@@ -74,7 +75,7 @@ mod imp {
         fn internal_error(message: String) -> Self {
             Self {
                 code: -32603,
-                message,
+                message: format!("Lemma: {}", message),
                 data: None,
             }
         }
@@ -103,35 +104,51 @@ mod imp {
     struct McpServer {
         engine: Engine,
         config: McpConfig,
+        sqlite_conn: rusqlite::Connection,
     }
 
     impl McpServer {
         fn new(engine: Engine, config: McpConfig) -> Self {
-            Self { engine, config }
+            let conn = rusqlite::Connection::open("lemma_cache.db").expect("Failed to open SQLite database");
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS eval_cache (
+                    hash TEXT PRIMARY KEY,
+                    output TEXT
+                )",
+                [],
+            ).expect("Failed to create eval_cache table");
+
+            Self { engine, config, sqlite_conn: conn }
         }
 
-        fn handle_request(&mut self, request: McpRequest) -> McpResponse {
+        fn handle_request(&mut self, request: McpRequest) -> Option<McpResponse> {
             debug!("Handling request: method={}", request.method);
 
             if request.jsonrpc != "2.0" {
-                return McpResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(McpError::invalid_request(
-                        "Invalid JSON-RPC version, expected '2.0'".to_string(),
-                    )),
-                };
+                error!("Invalid JSON-RPC version: '{}', expected '2.0'. Continuing anyway.", request.jsonrpc);
             }
+
+            // JSON-RPC 2.0: Notifications (no id) MUST NOT receive a response.
+            let is_notification = request.id.is_none();
 
             let result = match request.method.as_str() {
                 "initialize" => self.initialize(),
+                "notifications/initialized" | "initialized" => {
+                    info!("Client initialized notification received");
+                    if is_notification { return None; }
+                    Ok(serde_json::json!({}))
+                }
+                "ping" => Ok(serde_json::json!({})),
                 "tools/list" => self.list_tools(),
                 "tools/call" => self.call_tool(request.params),
+                _ if is_notification => {
+                    debug!("Ignoring unknown notification: {}", request.method);
+                    return None;
+                }
                 _ => Err(McpError::method_not_found(request.method)),
             };
 
-            match result {
+            Some(match result {
                 Ok(result) => McpResponse {
                     jsonrpc: "2.0".to_string(),
                     id: request.id,
@@ -144,7 +161,7 @@ mod imp {
                     result: None,
                     error: Some(error),
                 },
-            }
+            })
         }
 
         fn initialize(&self) -> Result<serde_json::Value, McpError> {
@@ -156,7 +173,9 @@ mod imp {
                     "version": SERVER_VERSION
                 },
                 "capabilities": {
-                    "tools": {}
+                    "tools": {
+                        "listChanged": false
+                    }
                 }
             }))
         }
@@ -444,6 +463,47 @@ mod imp {
                 .collect();
 
             let now = resolve_effective(args)?;
+
+            let plan = self
+                .engine
+                .get_plan(spec_id.trim(), Some(&now))
+                .map_err(|e| {
+                    McpError::internal_error(format!("Failed to get plan for spec: {e}"))
+                })?;
+            let plan_hash = plan.plan_hash();
+
+            // Cache Key Computation
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(spec_id.trim().as_bytes());
+            hasher.update(plan_hash.as_bytes());
+            let mut sorted_rules = rule_names.clone();
+            sorted_rules.sort();
+            for r in &sorted_rules {
+                hasher.update(r.as_bytes());
+            }
+            let mut sorted_facts: Vec<(&String, &String)> = fact_values.iter().collect();
+            sorted_facts.sort_by_key(|k| k.0);
+            for (k, v) in sorted_facts {
+                hasher.update(k.as_bytes());
+                hasher.update(b"=");
+                hasher.update(v.as_bytes());
+            }
+            let cache_hash = format!("{:x}", hasher.finalize());
+
+            // Check SQLite Cache
+            if let Ok(mut stmt) = self.sqlite_conn.prepare("SELECT output FROM eval_cache WHERE hash = ?") {
+                if let Ok(cached_output) = stmt.query_row([&cache_hash], |row| row.get::<_, String>(0)) {
+                    info!("Cache hit for spec '{}'", spec_id.trim());
+                    return Ok(serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": cached_output
+                        }]
+                    }));
+                }
+            }
+
             let mut response = self
                 .engine
                 .run(spec_id.trim(), Some(&now), fact_values, false)
@@ -455,18 +515,10 @@ mod imp {
                 response.filter_rules(&rule_names);
             }
 
-            let hash = self
-                .engine
-                .get_plan(spec_id.trim(), Some(&now))
-                .map_err(|e| {
-                    McpError::internal_error(format!("BUG: run succeeded but get_plan failed: {e}"))
-                })?
-                .plan_hash();
-
             let mut output = String::new();
             output.push_str(&format!("spec: {}\n", spec_id.trim()));
             output.push_str(&format!("effective: {}\n", now));
-            output.push_str(&format!("hash: {}\n", hash));
+            output.push_str(&format!("hash: {}\n", plan_hash));
             output.push('\n');
 
             for result in response.results.values() {
@@ -495,8 +547,16 @@ mod imp {
                 }
             }
 
+            // Save to SQLite Cache
+            if let Err(e) = self.sqlite_conn.execute(
+                "INSERT OR REPLACE INTO eval_cache (hash, output) VALUES (?, ?)",
+                rusqlite::params![&cache_hash, &output],
+            ) {
+                error!("Failed to save evaluation to cache: {}", e);
+            }
+
             info!(
-                "Evaluated spec '{}' with {} results",
+                "Evaluated spec '{}' with {} results (newly cached)",
                 spec_id.trim(),
                 response.results.len()
             );
@@ -860,26 +920,27 @@ mod imp {
                 continue;
             }
 
-            debug!("Received: {}", line);
+            eprintln!("MCP Received: {}", line);
 
             let response = match serde_json::from_str::<McpRequest>(&line) {
                 Ok(request) => server.handle_request(request),
                 Err(e) => {
                     error!("Parse error: {}", e);
-                    McpResponse {
+                    Some(McpResponse {
                         jsonrpc: "2.0".to_string(),
                         id: None,
                         result: None,
                         error: Some(McpError::parse_error(format!("Parse error: {e}"))),
-                    }
+                    })
                 }
             };
 
-            let response_json = serde_json::to_string(&response)?;
-            writeln!(stdout, "{}", response_json)?;
-            stdout.flush()?;
-
-            debug!("Sent response");
+            if let Some(response) = response {
+                let response_json = serde_json::to_string(&response)?;
+                writeln!(stdout, "{}", response_json)?;
+                stdout.flush()?;
+                debug!("Sent response");
+            }
         }
 
         info!("MCP server shutting down");
